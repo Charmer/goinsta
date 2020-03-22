@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,7 +28,11 @@ type jsonAccount struct {
 						ID                 string `json:"id"`
 						Typename           string `json:"__typename"`
 						EdgeMediaToCaption struct {
-							Edges []interface{} `json:"edges"`
+							Edges []struct {
+								Node struct {
+									Text string `json:"text"`
+								} `json:"node"`
+							} `json:"edges"`
 						} `json:"edge_media_to_caption"`
 						Shortcode          string `json:"shortcode"`
 						EdgeMediaToComment struct {
@@ -72,7 +77,9 @@ type Media struct {
 		w int
 		h int
 	}
-	URL string
+	URL          string
+	ThumbnailUrl string
+	Caption      string
 }
 
 type Profile struct {
@@ -82,17 +89,18 @@ type Profile struct {
 	CreatedAt string `db:"created_at"`
 	UpdatedAt string `db:"updated_at"`
 	Status    string `db:"Status"`
-	InstID    int `db:"inst_id"`
+	InstID    int    `db:"inst_id"`
 }
 
+var wg sync.WaitGroup
+
 func main() {
-	var wg sync.WaitGroup
-	db, err := sql.Open("mysql", "root:root@/instat")
+	db, err := sql.Open("mysql", "user:passwor@/instagram")
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
-	rows, err := db.Query("select * from instat.profiles")
+	rows, err := db.Query("select * from profiles")
 	if err != nil {
 		panic(err)
 	}
@@ -108,16 +116,20 @@ func main() {
 		}
 		profiles = append(profiles, p)
 	}
+	db.Close()
 
 	for _, p := range profiles {
 		wg.Add(1)
-		go Parser(p.InstID)
+		go Parser(p.InstID, p.UserID, p.ID)
 	}
-	time.Sleep(time.Duration(60) * time.Second)
+	wg.Wait()
+	fmt.Println("All done!")
+
 }
 
-func Parser(UserId int) {
-	url := "https://www.instagram.com/graphql/query/?query_id=17888483320059182&id=" + strconv.Itoa(UserId) + "&first=50"
+func Parser(InstId int, UserID string, ProfileID int) {
+	defer wg.Done()
+	url := "https://www.instagram.com/graphql/query/?query_id=17888483320059182&id=" + strconv.Itoa(InstId) + "&first=50"
 	EndCursor := ""
 	medias := make(map[string]Media)
 	for true {
@@ -125,7 +137,6 @@ func Parser(UserId int) {
 			Timeout: time.Second * 2, // Maximum of 2 secs
 		}
 
-		fmt.Println("Getting data from " + url + "&after=" + EndCursor)
 		req, err := http.NewRequest(http.MethodGet, url+"&after="+EndCursor, nil)
 		if err != nil {
 			panic(err)
@@ -140,7 +151,6 @@ func Parser(UserId int) {
 		if readErr != nil {
 			panic(err)
 		}
-		fmt.Println("Data loaded!")
 
 		account1 := jsonAccount{}
 		jsonErr := json.Unmarshal(body, &account1)
@@ -152,6 +162,10 @@ func Parser(UserId int) {
 			panic(err)
 		}
 		for k := range account1.Data.User.EdgeOwnerToTimelineMedia.Edges {
+			var caption string
+			for c := range account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.EdgeMediaToCaption.Edges {
+				caption = (account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.EdgeMediaToCaption.Edges[c].Node.Text)
+			}
 			m := Media{
 				ID:               account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.ID,
 				CommentsDisabled: account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.CommentsDisabled,
@@ -166,10 +180,11 @@ func Parser(UserId int) {
 					w: account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.Dimensions.Width,
 					h: account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.Dimensions.Height,
 				},
-				URL: "https://www.instagram.com/p/" + account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.Shortcode,
+				URL:          "https://www.instagram.com/p/" + account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.Shortcode,
+				ThumbnailUrl: account1.Data.User.EdgeOwnerToTimelineMedia.Edges[k].Node.ThumbnailSrc,
+				Caption:      caption,
 			}
 			medias[m.ID] = m
-			fmt.Println(len(medias))
 		}
 		if account1.Data.User.EdgeOwnerToTimelineMedia.PageInfo.HasNextPage {
 			EndCursor = account1.Data.User.EdgeOwnerToTimelineMedia.PageInfo.EndCursor
@@ -180,8 +195,36 @@ func Parser(UserId int) {
 		time.Sleep(time.Duration(r) * time.Second)
 	}
 
-	//for _, media := range medias {
-	//	fmt.Println(media.URL)
-	//}
-	fmt.Println(len(medias))
+	valueStrings := []string{}
+	valueArgs := []interface{}{}
+	for _, media := range medias {
+		i, err := strconv.ParseInt(media.CreatedAt, 10, 64)
+		if err != nil {
+			panic(err)
+		}
+		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?, ?)")
+
+		valueArgs = append(valueArgs, media.URL)
+		valueArgs = append(valueArgs, UserID)
+		valueArgs = append(valueArgs, time.Unix(i, 0).Format("2006-01-02 15:04:05"))
+		valueArgs = append(valueArgs, media.ThumbnailUrl)
+		valueArgs = append(valueArgs, media.Caption)
+		valueArgs = append(valueArgs, strconv.Itoa(ProfileID))
+		valueArgs = append(valueArgs, media.ID)
+	}
+	//TODO: Use one conection for all gorutines
+	db, err := sql.Open("mysql", "user:password@/instagram")
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		panic(err)
+	}
+	smt := "INSERT IGNORE INTO media(url, user_id, created_at, thumbnail_url, caption, profile_id, media_id) VALUES "
+	smt += strings.Join(valueStrings, ",")
+	_, err = tx.Exec(smt, valueArgs...)
+	if err != nil {
+		tx.Rollback()
+		panic(err)
+	}
+	tx.Commit()
 }
